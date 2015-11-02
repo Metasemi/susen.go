@@ -5,10 +5,12 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -20,6 +22,11 @@ type susenSession struct {
 	steps    []puzzle.Puzzle
 	puzzleID int
 }
+
+// channel used to inform the service that it's being shut down. nothing ever writes
+// to this channel; *closing* it signals a shutdown. (The advantage of this pattern is 
+// is that the 'shutting down' state can be read multiple times.)
+var stopper = make(chan bool)
 
 var (
 	puzzleValues = [][]int{
@@ -195,6 +202,16 @@ func (session *susenSession) undoStep() {
 }
 
 func (session *susenSession) apiHandler(w http.ResponseWriter, r *http.Request) {
+
+	select {
+	case <-stopper:
+	    // stopper channel is readable (has been closed); means server is shutting down.
+		// return without doing anything
+		return
+	default:
+		// fall through (process request normally)
+	}
+
 	if strings.Contains(r.URL.Path, "/reset/") {
 		re := regexp.MustCompile("/reset/([0-9]+)(/.*)?$")
 		if matches := re.FindStringSubmatch(r.URL.Path); matches != nil {
@@ -232,6 +249,10 @@ func (session *susenSession) apiHandler(w http.ResponseWriter, r *http.Request) 
 }
 
 func main() {
+
+	signaled := make(chan os.Signal)
+	signal.Notify(signaled, syscall.SIGINT, syscall.SIGTERM)
+
 	http.Handle("/static/", http.StripPrefix("/", http.FileServer(http.Dir("."))))
 	http.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Received %s %s - invoke /api/ handler in session.", r.Method, r.URL.Path)
@@ -257,6 +278,20 @@ func main() {
 		port = ":" + port
 	}
 
+	go runService(port)
+
+	// run indefinitely, until SIGINT or SIGTERM received; then notify 
+	// service of shutdown and die after a few seconds of grace
+	<-signaled
+	close(stopper)
+	const grace = 8
+	log.Printf("Shutting down in %v seconds...", grace)
+	time.Sleep(time.Second * grace)
+	log.Printf("Shutting down now...")
+
+}
+
+func runService(port string) {
 	log.Printf("Listening on %s...", port)
 	err := http.ListenAndServe(port, nil)
 	if err != nil {
